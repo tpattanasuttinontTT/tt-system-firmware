@@ -11,3 +11,7 @@ tst_dma0: &dma0 {
 &csm {
 	reg = <0x10000000 0x40000>; /* 256KB */
 };
+
+&vuart0 {
+	tx-cap = <16384>;   /* up from 3036; bump until the drops stop */
+};

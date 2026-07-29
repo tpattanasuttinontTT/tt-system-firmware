@@ -21,28 +21,32 @@
 #include <zephyr/drivers/dma.h>
 #include <zephyr/ztest.h>
 
-#define XFERS        4
-#define NUM_CHANNELS CONFIG_DMA_NUM_CHANNELS
+#define XFERS 4
+#define DMA_DATA_ALIGNMENT DT_PROP_OR(DT_NODELABEL(tst_dma0), dma_buf_addr_alignment, 32)
 
 #if CONFIG_NOCACHE_MEMORY
-static __aligned(32) uint8_t tx_data[CONFIG_DMA_SG_XFER_SIZE] __used
+static __aligned(DMA_DATA_ALIGNMENT) uint8_t tx_data[CONFIG_DMA_SG_XFER_SIZE] __used
 	__attribute__((__section__(".nocache")));
-static __aligned(32) uint8_t rx_data[XFERS][CONFIG_DMA_SG_XFER_SIZE] __used
+static __aligned(DMA_DATA_ALIGNMENT) uint8_t rx_data[XFERS][CONFIG_DMA_SG_XFER_SIZE] __used
 	__attribute__((__section__(".nocache.dma")));
 #else
 /* this src memory shall be in RAM to support using as a DMA source pointer.*/
-static __aligned(CONFIG_DMA_SG_ALIGNMENT) uint8_t tx_data[CONFIG_DMA_SG_XFER_SIZE];
-static __aligned(CONFIG_DMA_SG_ALIGNMENT) uint8_t rx_data[XFERS][CONFIG_DMA_SG_XFER_SIZE] = {{0}};
+static __aligned(DMA_DATA_ALIGNMENT) uint8_t tx_data[CONFIG_DMA_SG_XFER_SIZE];
+static __aligned(DMA_DATA_ALIGNMENT) uint8_t rx_data[XFERS][CONFIG_DMA_SG_XFER_SIZE] = { { 0 } };
 #endif
+
+K_SEM_DEFINE(xfer_sem, 0, 1);
 
 static struct dma_config dma_cfg = {0};
 static struct dma_block_config dma_block_cfgs[XFERS];
-static struct k_sem xfer_sem;
 
-static void dma_sg_callback(const struct device *dma_dev, void *user_data, uint32_t channel,
-			    int status)
+static void dma_sg_callback(const struct device *dma_dev, void *user_data,
+			    uint32_t channel, int status)
 {
-	if (status >= 0) {
+	if (status < 0) {
+		TC_PRINT("callback status %d\n", status);
+	} else {
+		TC_PRINT("giving xfer_sem\n");
 		k_sem_give(&xfer_sem);
 	}
 }
@@ -50,6 +54,7 @@ static void dma_sg_callback(const struct device *dma_dev, void *user_data, uint3
 static int test_sg(void)
 {
 	const struct device *dma;
+	int chan_ids[CONFIG_DMA_NUM_TEST_CHAN];
 
 	TC_PRINT("DMA memory to memory transfer started\n");
 	TC_PRINT("Preparing DMA Controller\n");
@@ -67,10 +72,10 @@ static int test_sg(void)
 	}
 
 	dma_cfg.channel_direction = MEMORY_TO_MEMORY;
-	dma_cfg.source_data_size = 1U;
-	dma_cfg.dest_data_size = 1U;
-	dma_cfg.source_burst_length = 1U;
-	dma_cfg.dest_burst_length = 1U;
+	dma_cfg.source_data_size = 4U;
+	dma_cfg.dest_data_size = 4U;
+	dma_cfg.source_burst_length = 4U;
+	dma_cfg.dest_burst_length = 4U;
 #ifdef CONFIG_DMAMUX_STM32
 	dma_cfg.user_data = (struct device *)dma;
 #else
@@ -79,65 +84,83 @@ static int test_sg(void)
 	dma_cfg.dma_callback = dma_sg_callback;
 	dma_cfg.block_count = XFERS;
 	dma_cfg.head_block = dma_block_cfgs;
-	dma_cfg.complete_callback_en = false;
+	dma_cfg.complete_callback_en = false; /* per block completion */
 
 #ifdef CONFIG_DMA_MCUX_TEST_SLOT_START
 	dma_cfg.dma_slot = CONFIG_DMA_MCUX_TEST_SLOT_START;
 #endif
 
-	/* Run the scatter-gather test on each channel one by one, assuming
-	 * channels 0..NUM_CHANNELS-1 are available for use without requesting.
-	 */
-	for (int i = 0; i < NUM_CHANNELS; i++) {
+	/* Acquire all channels up front */
+	for (int c = 0; c < CONFIG_DMA_NUM_TEST_CHAN; c++) {
+		chan_ids[c] = dma_request_channel(dma, NULL);
+		if (chan_ids[c] < 0) {
+			TC_PRINT("Platform does not support dma request channel,"
+				 " using Kconfig DMA_SG_CHANNEL_NR\n");
+			chan_ids[c] = CONFIG_DMA_SG_CHANNEL_NR + c;
+		}
+	}
+
+	for (int c = 0; c < CONFIG_DMA_NUM_TEST_CHAN; c++) {
+		int chan_id = chan_ids[c];
 
 		memset(rx_data, 0, sizeof(rx_data));
-		memset(dma_block_cfgs, 0, sizeof(dma_block_cfgs));
-		k_sem_init(&xfer_sem, 0, 1);
+		k_sem_reset(&xfer_sem);
 
-		for (int j = 0; j < XFERS; j++) {
-			dma_block_cfgs[j].source_gather_en = 1U;
-			dma_block_cfgs[j].block_size = CONFIG_DMA_SG_XFER_SIZE;
+		memset(dma_block_cfgs, 0, sizeof(dma_block_cfgs));
+		for (int i = 0; i < XFERS; i++) {
+			dma_block_cfgs[i].source_gather_en = 1U;
+			dma_block_cfgs[i].block_size = CONFIG_DMA_SG_XFER_SIZE;
 #ifdef CONFIG_DMA_64BIT
-			dma_block_cfgs[j].source_address = (uint64_t)(tx_data);
-			dma_block_cfgs[j].dest_address = (uint64_t)(rx_data[j]);
+			dma_block_cfgs[i].source_address = (uint64_t)(tx_data);
+			dma_block_cfgs[i].dest_address = (uint64_t)(rx_data[i]);
+			TC_PRINT("dma block %d block_size %d, source addr 0x%" PRIx64 ", dest addr 0x%"
+			     PRIx64 "\n", i, CONFIG_DMA_SG_XFER_SIZE, dma_block_cfgs[i].source_address,
+				 dma_block_cfgs[i].dest_address);
 #else
-			dma_block_cfgs[j].source_address = (uint32_t)(tx_data);
-			dma_block_cfgs[j].dest_address = (uint32_t)(rx_data[j]);
+			dma_block_cfgs[i].source_address = (uint32_t)(tx_data);
+			dma_block_cfgs[i].dest_address = (uint32_t)(rx_data[i]);
+			TC_PRINT("dma block %d block_size %d, source addr 0x%x, dest addr 0x%x\n",
+				 i, CONFIG_DMA_SG_XFER_SIZE, dma_block_cfgs[i].source_address,
+				 dma_block_cfgs[i].dest_address);
 #endif
-			if (j < XFERS - 1) {
-				dma_block_cfgs[j].next_block = &dma_block_cfgs[j + 1];
+			if (i < XFERS - 1) {
+				dma_block_cfgs[i].next_block = &dma_block_cfgs[i+1];
+				TC_PRINT("set next block pointer to %p\n",
+					 dma_block_cfgs[i].next_block);
 			}
 		}
 
-		TC_PRINT("Configuring the scatter-gather transfer on channel %d\n", i);
+		TC_PRINT("Configuring the scatter-gather transfer on channel %d\n", chan_id);
 
-		if (dma_config(dma, i, &dma_cfg)) {
-			TC_PRINT("ERROR: transfer config (%d)\n", i);
+		if (dma_config(dma, chan_id, &dma_cfg)) {
+			TC_PRINT("ERROR: transfer config (%d)\n", chan_id);
 			return TC_FAIL;
 		}
 
-		if (dma_start(dma, i)) {
-			TC_PRINT("ERROR: transfer start (%d)\n", i);
+		TC_PRINT("Starting the transfer on channel %d and waiting completion\n", chan_id);
+
+		if (dma_start(dma, chan_id)) {
+			TC_PRINT("ERROR: transfer start (%d)\n", chan_id);
 			return TC_FAIL;
 		}
 
-		if (k_sem_take(&xfer_sem, K_SECONDS(5)) != 0) {
-			TC_PRINT("Timed out waiting for completion on channel %d\n", i);
-			dma_stop(dma, i);
+		if (k_sem_take(&xfer_sem, K_MSEC(1000)) != 0) {
+			TC_PRINT("Timed out waiting for xfers\n");
 			return TC_FAIL;
 		}
 
 		TC_PRINT("Verify RX buffer should contain the full TX buffer string.\n");
 
-		for (int j = 0; j < XFERS; j++) {
-			if (memcmp(tx_data, rx_data[j], CONFIG_DMA_SG_XFER_SIZE)) {
-				dma_stop(dma, i);
+		for (int i = 0; i < XFERS; i++) {
+			TC_PRINT("rx_data[%d]\n", i);
+			if (memcmp(tx_data, rx_data[i], CONFIG_DMA_SG_XFER_SIZE)) {
 				return TC_FAIL;
 			}
 		}
+	}
 
-		dma_stop(dma, i);
-		k_msleep(10);
+	for (int c = 0; c < CONFIG_DMA_NUM_TEST_CHAN; c++) {
+		dma_release_channel(dma, chan_ids[c]);
 	}
 
 	TC_PRINT("Finished: DMA Scatter-Gather\n");

@@ -16,3 +16,16 @@ config DMA_SG_XFER_SIZE
 config DMA_SG_ALIGNMENT
 	int "TX and RX data alignment in bytes"
 	default 32
+	
+config DMA_SG_CHANNEL_NR
+	int "DMA channel to use"
+	default 0
+
+config DMA_NUM_TEST_CHAN
+	int "Number of DMA channels to test per controller"
+	default 16
+	help
+	  Number of channels to exercise per DMA controller. The test acquires
+	  this many channels up front (via dma_request_channel(), falling back to
+	  CONFIG_DMA_SG_CHANNEL_NR + index) and runs the scatter-gather transfer
+	  on each channel sequentially.
